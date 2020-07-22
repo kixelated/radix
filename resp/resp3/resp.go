@@ -1,5 +1,5 @@
 // Package resp3 implements the upgraded redis RESP3 protocol, a plaintext
-// protocol which is also binary safe and backwards compatible with th eoriginal
+// protocol which is also binary safe and backwards compatible with the original
 // RESP2 protocol. Redis uses the RESP protocol to communicate with its clients,
 // but there's nothing about the protocol which ties it to redis, it could be
 // used for almost anything.
@@ -27,40 +27,39 @@ import (
 
 var delim = []byte{'\r', '\n'}
 
-// prefix enumerates the possible RESP types by enumerating the different
-// prefixes a RESP message might start with.
-type prefix []byte
-
-// Enumeration of each of RESP's message types, each denoted by the prefix which
-// is prepended to messages of that type.
+// Prefix enumerates the possible RESP3 types by enumerating the different
+// prefixes a RESP3 message might start with.
 //
 // In order to determine the type of a message which is being written to a
 // *bufio.Reader, without actually consuming it, one can use the Peek method and
-// compare it against these values.
+// compare it against a Prefix value.
+type Prefix byte
+
+// Enumeration of each of RESP3 prefices.
 var (
-	BlobStringPrefix     = []byte{'$'}
-	SimpleStringPrefix   = []byte{'+'}
-	SimpleErrorPrefix    = []byte{'-'}
-	NumberPrefix         = []byte{':'}
-	NullPrefix           = []byte{'_'}
-	DoublePrefix         = []byte{','}
-	BooleanPrefix        = []byte{'#'}
-	BlobErrorPrefix      = []byte{'!'}
-	VerbatimStringPrefix = []byte{'='}
-	BigNumberPrefix      = []byte{'('}
+	BlobStringPrefix     Prefix = '$'
+	SimpleStringPrefix   Prefix = '+'
+	SimpleErrorPrefix    Prefix = '-'
+	NumberPrefix         Prefix = ':'
+	NullPrefix           Prefix = '_'
+	DoublePrefix         Prefix = ','
+	BooleanPrefix        Prefix = '#'
+	BlobErrorPrefix      Prefix = '!'
+	VerbatimStringPrefix Prefix = '='
+	BigNumberPrefix      Prefix = '('
 
-	ArrayPrefix     = []byte{'*'}
-	MapPrefix       = []byte{'%'}
-	SetPrefix       = []byte{'~'}
-	AttributePrefix = []byte{'|'}
-	PushPrefix      = []byte{'>'}
+	ArrayPrefix     Prefix = '*'
+	MapPrefix       Prefix = '%'
+	SetPrefix       Prefix = '~'
+	AttributePrefix Prefix = '|'
+	PushPrefix      Prefix = '>'
 
-	StreamedAggregatedTypeEndPrefix = []byte{'.'}
-	StreamedStringChunkPrefix       = []byte{';'}
+	StreamedAggregatedTypeEndPrefix Prefix = '.'
+	StreamedStringChunkPrefix       Prefix = ';'
 )
 
 // String formats a prefix into a human-readable name for the type it denotes.
-func (p prefix) String() string {
+func (p Prefix) String() string {
 	pStr := string(p)
 	switch pStr {
 	case string(BlobStringPrefix):
@@ -102,6 +101,14 @@ func (p prefix) String() string {
 	}
 }
 
+func (p Prefix) doesPrefix(b []byte) bool {
+	if len(b) == 0 {
+		panic("empty byte slice should not be passed here, please submit a bug report")
+	}
+
+	return Prefix(b[0]) == p
+}
+
 var (
 	// TODO null values shouldn't be needed here
 	nullRESP2Bulktring = []byte("$-1\r\n")
@@ -114,17 +121,21 @@ var (
 	streamAggEnd       = []byte(".\r\n")
 )
 
-var bools = [][]byte{
+var boolStrs = [][]byte{
 	{'0'},
 	{'1'},
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// l may be negative to indicate that elements should be discarded until a
+// streamed aggregated end type message is encountered.
 func discardMulti(br *bufio.Reader, l int) error {
-	for i := 0; i < l; i++ {
-		if err := (Any{}).UnmarshalRESP(br); err != nil {
+	for i := 0; i < l || l < 0; i++ {
+		if more, err := (Any{}).maybeUnmarshalRESP(br, l < 0); err != nil {
 			return err
+		} else if !more {
+			return nil
 		}
 	}
 	return nil
@@ -132,10 +143,10 @@ func discardMulti(br *bufio.Reader, l int) error {
 
 func discardAttribute(br *bufio.Reader) error {
 	var attrHead AttributeHeader
-	b, err := br.Peek(len(AttributePrefix))
+	b, err := br.Peek(1)
 	if err != nil {
 		return err
-	} else if !bytes.Equal(b, AttributePrefix) {
+	} else if !AttributePrefix.doesPrefix(b) {
 		return nil
 	} else if err := attrHead.UnmarshalRESP(br); err != nil {
 		return nil
@@ -145,16 +156,12 @@ func discardAttribute(br *bufio.Reader) error {
 }
 
 type errUnexpectedPrefix struct {
-	Prefix         []byte
-	ExpectedPrefix []byte
+	Prefix         Prefix
+	ExpectedPrefix Prefix
 }
 
 func (e errUnexpectedPrefix) Error() string {
-	return fmt.Sprintf(
-		"expected prefix %q, got %q",
-		prefix(e.ExpectedPrefix).String(),
-		prefix(e.Prefix).String(),
-	)
+	return fmt.Sprintf("expected prefix %q, got %q", e.ExpectedPrefix, e.Prefix)
 }
 
 // peekAndAssertPrefix will peek at the next incoming redis message and assert
@@ -168,42 +175,42 @@ func (e errUnexpectedPrefix) Error() string {
 //
 // peekAndAssertPrefix will discard any preceding attribute message when called
 // with discardAttr set
-func peekAndAssertPrefix(br *bufio.Reader, expectedPrefix []byte, discardAttr bool) error {
+func peekAndAssertPrefix(br *bufio.Reader, expectedPrefix Prefix, discardAttr bool) error {
 	if discardAttr {
 		if err := discardAttribute(br); err != nil {
 			return err
 		}
 	}
 
-	b, err := br.Peek(len(expectedPrefix))
+	b, err := br.Peek(1)
 	if err != nil {
 		return err
-	} else if bytes.Equal(b, expectedPrefix) {
+	} else if expectedPrefix.doesPrefix(b) {
 		return nil
-	} else if bytes.Equal(b, SimpleErrorPrefix) {
+	} else if SimpleErrorPrefix.doesPrefix(b) {
 		var respErr SimpleError
 		if err := respErr.UnmarshalRESP(br); err != nil {
 			return err
 		}
 		return resp.ErrConnUsable{Err: respErr}
-	} else if bytes.Equal(b, BlobErrorPrefix) {
+	} else if BlobErrorPrefix.doesPrefix(b) {
 		panic("TODO")
 	} else if err := (Any{}).UnmarshalRESP(br); err != nil {
 		return err
 	}
 	return resp.ErrConnUsable{Err: errUnexpectedPrefix{
-		Prefix:         b,
+		Prefix:         Prefix(b[0]),
 		ExpectedPrefix: expectedPrefix,
 	}}
 }
 
 // like peekAndAssertPrefix, but will consume the prefix if it is the correct
 // one as well.
-func readAndAssertPrefix(br *bufio.Reader, pref []byte, discardAttr bool) error {
-	if err := peekAndAssertPrefix(br, pref, discardAttr); err != nil {
+func readAndAssertPrefix(br *bufio.Reader, prefix Prefix, discardAttr bool) error {
+	if err := peekAndAssertPrefix(br, prefix, discardAttr); err != nil {
 		return err
 	}
-	_, err := br.Discard(len(pref))
+	_, err := br.Discard(1)
 	return err
 }
 
@@ -228,7 +235,7 @@ func (b BlobStringBytes) MarshalRESP(w io.Writer) error {
 	scratch := bytesutil.GetBytes()
 	defer bytesutil.PutBytes(scratch)
 
-	*scratch = append(*scratch, BlobStringPrefix...)
+	*scratch = append(*scratch, byte(BlobStringPrefix))
 	if b.StreamedStringHeader {
 		*scratch = append(*scratch, streamHeaderSize...)
 	} else {
@@ -298,7 +305,7 @@ func (b BlobString) MarshalRESP(w io.Writer) error {
 	scratch := bytesutil.GetBytes()
 	defer bytesutil.PutBytes(scratch)
 
-	*scratch = append(*scratch, BlobStringPrefix...)
+	*scratch = append(*scratch, byte(BlobStringPrefix))
 	if b.StreamedStringHeader {
 		*scratch = append(*scratch, streamHeaderSize...)
 	} else {
@@ -364,7 +371,7 @@ func (ss SimpleString) MarshalRESP(w io.Writer) error {
 	scratch := bytesutil.GetBytes()
 	defer bytesutil.PutBytes(scratch)
 
-	*scratch = append(*scratch, SimpleStringPrefix...)
+	*scratch = append(*scratch, byte(SimpleStringPrefix))
 	*scratch = append(*scratch, ss.S...)
 	*scratch = append(*scratch, delim...)
 	_, err := w.Write(*scratch)
@@ -389,14 +396,13 @@ func (ss *SimpleString) UnmarshalRESP(br *bufio.Reader) error {
 
 // SimpleError represents the simple error type in the RESP protocol. Note that
 // this only represents an actual error message being read/written on the
-// stream, it is separate from network or parsing errors. An E value of nil is
-// equivalent to an empty error string.
+// stream, it is separate from network or parsing errors.
 type SimpleError struct {
-	E error
+	S string
 }
 
 func (e SimpleError) Error() string {
-	return e.E.Error()
+	return e.S
 }
 
 // MarshalRESP implements the Marshaler method.
@@ -404,10 +410,8 @@ func (e SimpleError) MarshalRESP(w io.Writer) error {
 	scratch := bytesutil.GetBytes()
 	defer bytesutil.PutBytes(scratch)
 
-	*scratch = append(*scratch, SimpleErrorPrefix...)
-	if e.E != nil {
-		*scratch = append(*scratch, e.E.Error()...)
-	}
+	*scratch = append(*scratch, byte(SimpleErrorPrefix))
+	*scratch = append(*scratch, e.S...)
 	*scratch = append(*scratch, delim...)
 	_, err := w.Write(*scratch)
 	return err
@@ -419,7 +423,7 @@ func (e *SimpleError) UnmarshalRESP(br *bufio.Reader) error {
 		return err
 	}
 	b, err := bytesutil.ReadBytesDelim(br)
-	e.E = errors.New(string(b))
+	e.S = string(b)
 	return err
 }
 
@@ -435,7 +439,7 @@ func (n Number) MarshalRESP(w io.Writer) error {
 	scratch := bytesutil.GetBytes()
 	defer bytesutil.PutBytes(scratch)
 
-	*scratch = append(*scratch, NumberPrefix...)
+	*scratch = append(*scratch, byte(NumberPrefix))
 	*scratch = strconv.AppendInt(*scratch, n.N, 10)
 	*scratch = append(*scratch, delim...)
 	_, err := w.Write(*scratch)
@@ -475,13 +479,14 @@ func (*Null) UnmarshalRESP(br *bufio.Reader) error {
 		return err
 	}
 
-	prefix, err := br.Peek(1)
+	b, err := br.Peek(1)
 	if err != nil {
 		return err
 	}
+	prefix := Prefix(b[0])
 
-	switch prefix[0] {
-	case NullPrefix[0]:
+	switch prefix {
+	case NullPrefix:
 		b, err := bytesutil.ReadBytesDelim(br)
 		if err != nil {
 			return err
@@ -490,7 +495,7 @@ func (*Null) UnmarshalRESP(br *bufio.Reader) error {
 		}
 		return nil
 
-	case ArrayPrefix[0], BlobStringPrefix[0]:
+	case ArrayPrefix, BlobStringPrefix:
 		// no matter what size an array or blob string is it _must_ have at
 		// least 4 characters on the wire (prefix+size+delim). So only check
 		// that.
@@ -529,7 +534,7 @@ type Double struct {
 // MarshalRESP implements the Marshaler method.
 func (d Double) MarshalRESP(w io.Writer) error {
 	scratch := bytesutil.GetBytes()
-	*scratch = append(*scratch, DoublePrefix...)
+	*scratch = append(*scratch, byte(DoublePrefix))
 
 	if math.IsInf(d.F, 1) {
 		*scratch = append(*scratch, "inf"...)
@@ -603,11 +608,11 @@ func (b *Boolean) UnmarshalRESP(br *bufio.Reader) error {
 
 // BlobError represents the blob error type in the RESP protocol.
 type BlobError struct {
-	E error
+	B []byte
 }
 
 func (e BlobError) Error() string {
-	return e.E.Error()
+	return string(e.B)
 }
 
 // MarshalRESP implements the Marshaler method.
@@ -615,11 +620,10 @@ func (e BlobError) MarshalRESP(w io.Writer) error {
 	scratch := bytesutil.GetBytes()
 	defer bytesutil.PutBytes(scratch)
 
-	errStr := e.E.Error()
-	*scratch = append(*scratch, BlobErrorPrefix...)
-	*scratch = strconv.AppendInt(*scratch, int64(len(errStr)), 10)
+	*scratch = append(*scratch, byte(BlobErrorPrefix))
+	*scratch = strconv.AppendInt(*scratch, int64(len(e.B)), 10)
 	*scratch = append(*scratch, delim...)
-	*scratch = append(*scratch, errStr...)
+	*scratch = append(*scratch, e.B...)
 	*scratch = append(*scratch, delim...)
 	_, err := w.Write(*scratch)
 	return err
@@ -648,7 +652,7 @@ func (e *BlobError) UnmarshalRESP(br *bufio.Reader) error {
 		return err
 	}
 
-	e.E = errors.New(string(*scratch))
+	e.B = *scratch
 	return nil
 }
 
@@ -675,7 +679,7 @@ func (b VerbatimStringBytes) MarshalRESP(w io.Writer) error {
 	scratch := bytesutil.GetBytes()
 	defer bytesutil.PutBytes(scratch)
 
-	*scratch = append(*scratch, VerbatimStringPrefix...)
+	*scratch = append(*scratch, byte(VerbatimStringPrefix))
 	*scratch = strconv.AppendInt(*scratch, int64(len(b.B))+4, 10)
 	*scratch = append(*scratch, delim...)
 	*scratch = append(*scratch, b.Format...)
@@ -737,7 +741,7 @@ func (b VerbatimString) MarshalRESP(w io.Writer) error {
 	scratch := bytesutil.GetBytes()
 	defer bytesutil.PutBytes(scratch)
 
-	*scratch = append(*scratch, VerbatimStringPrefix...)
+	*scratch = append(*scratch, byte(VerbatimStringPrefix))
 	*scratch = strconv.AppendInt(*scratch, int64(len(b.S))+4, 10)
 	*scratch = append(*scratch, delim...)
 	*scratch = append(*scratch, b.Format...)
@@ -787,7 +791,7 @@ func (b BigNumber) MarshalRESP(w io.Writer) error {
 	scratch := bytesutil.GetBytes()
 	defer bytesutil.PutBytes(scratch)
 
-	*scratch = append(*scratch, BigNumberPrefix...)
+	*scratch = append(*scratch, byte(BigNumberPrefix))
 	*scratch = b.I.Append(*scratch, 10)
 	*scratch = append(*scratch, delim...)
 	_, err := w.Write(*scratch)
@@ -834,7 +838,7 @@ func (b BulkReader) MarshalRESP(w io.Writer) error {
 	defer bytesutil.PutBytes(scratch)
 
 	l := b.LR.Len()
-	*scratch = append(*scratch, BlobStringPrefix...)
+	*scratch = append(*scratch, byte(BlobStringPrefix))
 	*scratch = strconv.AppendInt(*scratch, l, 10)
 	*scratch = append(*scratch, delim...)
 	_, err := w.Write(*scratch)
@@ -852,11 +856,11 @@ func (b BulkReader) MarshalRESP(w io.Writer) error {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-func marshalAggHeader(w io.Writer, prefix []byte, n int, streamHeader bool) error {
+func marshalAggHeader(w io.Writer, prefix Prefix, n int, streamHeader bool) error {
 	scratch := bytesutil.GetBytes()
 	defer bytesutil.PutBytes(scratch)
 
-	*scratch = append(*scratch, prefix...)
+	*scratch = append(*scratch, byte(prefix))
 	if streamHeader {
 		*scratch = append(*scratch, streamHeaderSize...)
 	} else {
@@ -867,7 +871,7 @@ func marshalAggHeader(w io.Writer, prefix []byte, n int, streamHeader bool) erro
 	return err
 }
 
-func unmarshalAggHeader(br *bufio.Reader, prefix []byte, n *int, streamHeader *bool, discardAttr bool) error {
+func unmarshalAggHeader(br *bufio.Reader, prefix Prefix, n *int, streamHeader *bool, discardAttr bool) error {
 	if err := readAndAssertPrefix(br, prefix, discardAttr); err != nil {
 		return err
 	}
@@ -1026,7 +1030,7 @@ func (b StreamedStringChunkBytes) MarshalRESP(w io.Writer) error {
 	defer bytesutil.PutBytes(scratch)
 
 	l := int64(len(b.B))
-	*scratch = append(*scratch, StreamedStringChunkPrefix...)
+	*scratch = append(*scratch, byte(StreamedStringChunkPrefix))
 	*scratch = strconv.AppendInt(*scratch, l, 10)
 	*scratch = append(*scratch, delim...)
 	if l > 0 {
@@ -1077,7 +1081,7 @@ func (b StreamedStringChunk) MarshalRESP(w io.Writer) error {
 	defer bytesutil.PutBytes(scratch)
 
 	l := int64(len(b.S))
-	*scratch = append(*scratch, StreamedStringChunkPrefix...)
+	*scratch = append(*scratch, byte(StreamedStringChunkPrefix))
 	*scratch = strconv.AppendInt(*scratch, l, 10)
 	*scratch = append(*scratch, delim...)
 	if l > 0 {
@@ -1119,6 +1123,91 @@ func (b *StreamedStringChunk) UnmarshalRESP(br *bufio.Reader) error {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// StreamedStringReader implements reading a streamed string RESP message off
+// the wire and writing the data being streamed onto the given io.Writer. The
+// UnmarshalRESP method will block until the full streamed string has been read
+// off and written to the given io.Writer.
+type StreamedStringReader struct {
+	W io.Writer
+}
+
+// UnmarshalRESP implements the Unmarshaler method.
+func (r StreamedStringReader) UnmarshalRESP(br *bufio.Reader) error {
+	if err := peekAndAssertPrefix(br, StreamedStringChunkPrefix, true); errors.As(err, new(errUnexpectedPrefix)) {
+		// the first message in a stream will be a blob string with a size of
+		// "?". Discard that message if it comes up.
+		//
+		// Technically this would also discard a "?" sized blob string which
+		// showed up in the middle of a stream, as well as allow a streamed
+		// string with no prefix at all. Not ideal, but it would require some
+		// state on the StreamedStringReader to fix it, which we don't do for
+		// any other Unmarshalers.
+		if err := peekAndAssertPrefix(br, BlobStringPrefix, true); err != nil {
+			return err
+		}
+		var u BlobStringBytes
+		if err := u.UnmarshalRESP(br); err != nil {
+			return err
+		} else if !u.StreamedStringHeader {
+			return errors.New("sized blob string received instead of an unknown sized streamed string")
+		}
+	}
+
+	scratch := bytesutil.GetBytes()
+	defer bytesutil.PutBytes(scratch)
+
+	chunkBytes := StreamedStringChunkBytes{B: *scratch}
+	for {
+		if err := chunkBytes.UnmarshalRESP(br); err != nil {
+			return err
+		} else if len(chunkBytes.B) == 0 {
+			return nil
+		} else if _, err := r.W.Write(chunkBytes.B); err != nil {
+			return err
+		}
+	}
+}
+
+// StreamedStringWriter implements reading raw bytes off of a given io.Reader
+// and writing them to an io.Writer as a RESP streamed string message. The
+// MarshalRESP method will block until the given io.Reader has returned io.EOF.
+//
+// TODO This needs tests
+type StreamedStringWriter struct {
+	R io.Reader
+
+	// Buffer will be used for io.Read calls on the given io.Reader. If nil then
+	// a buffer of reasonable size will retrieved from a pool and be used
+	// instead.
+	Buffer []byte
+}
+
+// MarshalRESP implements the Marshaler method.
+func (sw *StreamedStringWriter) MarshalRESP(w io.Writer) error {
+	if err := (BlobStringBytes{StreamedStringHeader: true}).MarshalRESP(w); err != nil {
+		return err
+	}
+
+	scratch := &sw.Buffer
+	if len(*scratch) == 0 {
+		scratch = bytesutil.GetBytes()
+		defer bytesutil.PutBytes(scratch)
+		*scratch = bytesutil.Expand(*scratch, 1024, false)
+	}
+
+	for {
+		if _, err := sw.R.Read(*scratch); errors.Is(err, io.EOF) {
+			return nil
+		} else if err != nil {
+			return err
+		} else if (StreamedStringChunkBytes{B: *scratch}).MarshalRESP(w); err != nil {
+			return err
+		}
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 // StreamedAggregatedElement is used to unmarshal the elements of a streamed
 // aggregated type such that it is possible to check if the end of the stream
 // has been reached.
@@ -1129,7 +1218,7 @@ type StreamedAggregatedElement struct {
 
 	// End is used when UnmarshalRESP is called to indicate that the message
 	// read was the streamed aggregated end type (".\r\n") and so the end of the
-	// stream has been reached.. If this is true then UnmarshalRESP was not
+	// stream has been reached. If this is true then UnmarshalRESP was not
 	// called on the Unmarshaler field.
 	End bool
 }
@@ -1158,18 +1247,20 @@ func (s StreamedAggregatedEnd) MarshalRESP(w io.Writer) error {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-func discardMultiAfterErr(br *bufio.Reader, left int, err error) error {
+// left may be negative to indicate that elements should be discarded until a
+// streamed aggregated end type message is encountered.
+func discardMultiAfterErr(br *bufio.Reader, left int, lastErr error) error {
 	// if the last error which occurred didn't discard the message it was on, we
 	// can't do anything
-	if !errors.As(err, new(resp.ErrConnUsable)) {
-		return err
+	if !errors.As(lastErr, new(resp.ErrConnUsable)) {
+		return lastErr
 	} else if err := discardMulti(br, left); err != nil {
 		return err
 	}
 
-	// The original error was already wrapped in an ErrConnUsable, so just return
-	// it as it was given
-	return err
+	// The original error was already wrapped in an ErrConnUsable, so just
+	// return it as it was given
+	return lastErr
 }
 
 // Any represents any primitive go type, such as integers, floats, strings,
@@ -1327,11 +1418,10 @@ func (a Any) MarshalRESP(w io.Writer) error {
 		*scratch = append(*scratch, at...)
 		return marshalBlobStr(*scratch)
 	case bool:
-		b := bools[0]
 		if at {
-			b = bools[1]
+			return marshalBlobStr(boolStrs[1])
 		}
-		return marshalBlobStr(b)
+		return marshalBlobStr(boolStrs[0])
 	case float32:
 		scratch := bytesutil.GetBytes()
 		defer bytesutil.PutBytes(scratch)
@@ -1361,7 +1451,7 @@ func (a Any) MarshalRESP(w io.Writer) error {
 			return marshalBlobStr(*scratch)
 		}
 		// TODO or blob error?
-		return SimpleError{E: at}.MarshalRESP(w)
+		return SimpleError{S: at.Error()}.MarshalRESP(w)
 	case resp.LenReader:
 		return BulkReader{LR: at}.MarshalRESP(w)
 	case encoding.TextMarshaler:
@@ -1497,19 +1587,19 @@ func (a Any) marshalStruct(w io.Writer, vv reflect.Value, inline bool) error {
 	return nil
 }
 
-func saneDefault(prefix byte) interface{} {
+func saneDefault(prefix Prefix) interface{} {
 	// we don't handle ErrorPrefix because that always returns an error and
 	// doesn't touch I
 	switch prefix {
-	case ArrayPrefix[0]:
+	case ArrayPrefix:
 		ii := make([]interface{}, 8)
 		return &ii
-	case BlobStringPrefix[0]:
+	case BlobStringPrefix:
 		bb := make([]byte, 16)
 		return &bb
-	case SimpleStringPrefix[0]:
+	case SimpleStringPrefix:
 		return new(string)
-	case NumberPrefix[0]:
+	case NumberPrefix:
 		return new(int64)
 	}
 	panic("should never get here")
@@ -1544,7 +1634,25 @@ func (a Any) UnmarshalRESP(br *bufio.Reader) error {
 	if err != nil {
 		return err
 	}
-	prefix := b[0]
+	prefix := Prefix(b[0])
+
+	// if the prefix is one of the error types then just parse and return that
+	// full message here using the actual unmarshalers, which is easier than
+	// re-implementing them.
+	switch prefix {
+	case SimpleErrorPrefix:
+		var into SimpleError
+		if err := into.UnmarshalRESP(br); err != nil {
+			return err
+		}
+		return resp.ErrConnUsable{Err: into}
+	case BlobErrorPrefix:
+		var into BlobError
+		if err := into.UnmarshalRESP(br); err != nil {
+			return err
+		}
+		return resp.ErrConnUsable{Err: into}
+	}
 
 	// This is a super special case that _must_ be handled before we actually
 	// read from the reader. If an *interface{} is given we instead unmarshal
@@ -1566,22 +1674,60 @@ func (a Any) UnmarshalRESP(br *bufio.Reader) error {
 	}
 
 	switch prefix {
-	case SimpleErrorPrefix[0]:
-		return resp.ErrConnUsable{Err: SimpleError{E: errors.New(string(b))}}
-	case ArrayPrefix[0]:
-		l, err := bytesutil.ParseInt(b)
-		if err != nil {
+	case NullPrefix:
+		return a.unmarshalNil()
+
+	case ArrayPrefix, MapPrefix, SetPrefix, PushPrefix:
+		var l int64
+		if len(b) == 1 && b[0] == '?' {
+			l = -1
+		} else if l, err = bytesutil.ParseInt(b); err != nil {
 			return err
 		} else if l == -1 {
 			return a.unmarshalNil()
 		}
-		return a.unmarshalArray(br, l)
-	case BlobStringPrefix[0]:
-		l, err := bytesutil.ParseInt(b) // fuck DRY
-		if err != nil {
+		return a.unmarshalAgg(prefix, br, l)
+
+	case BlobStringPrefix, VerbatimStringPrefix:
+		var l int64
+		if len(b) == 1 && b[0] == '?' {
+			l = -1
+		} else if l, err = bytesutil.ParseInt(b); err != nil {
 			return err
 		} else if l == -1 {
 			return a.unmarshalNil()
+		}
+
+		// if it's a verbatim string then discard the preceding type indicator
+		// which is part of it.
+		if prefix == VerbatimStringPrefix {
+			if l < 4 {
+				return errors.New("malformed verbatim string, invalid length")
+			} else if _, err := br.Discard(4); err != nil {
+				return err
+			}
+			l -= 4
+
+		} else if l == -1 { // streamed string
+			var buf *bytes.Buffer
+			var r io.Reader = br
+			w, ok := a.I.(io.Writer)
+			if !ok {
+				// If you're reading this comment and don't want to incur an
+				// allocation here then pass in your own io.Writer as the I
+				// field.
+				buf = new(bytes.Buffer)
+				r = buf
+				w = buf
+			}
+
+			if err := (StreamedStringReader{W: w}).UnmarshalRESP(br); err != nil {
+				return err
+			} else if ok {
+				return nil
+			} else {
+				return a.unmarshalSingle(r, buf.Len())
+			}
 		}
 
 		// This is a bit of a clusterfuck. Basically:
@@ -1598,14 +1744,31 @@ func (a Any) UnmarshalRESP(br *bufio.Reader) error {
 			return discardErr
 		}
 		return err
-	case SimpleStringPrefix[0], NumberPrefix[0]:
+
+	case BooleanPrefix:
+		// convert the f/t boolean body to 0/1, so we're able to have consistent
+		// logic related to unmarshaling booleans into ints/floats and
+		// unmarshaling ints/floats/strings into booleans.
+		if len(b) != 1 {
+			return fmt.Errorf("malformed boolean resp body: %q", b)
+		} else if b[0] == 't' {
+			b[0] = '1'
+		} else if b[0] == 'f' {
+			b[0] = '0'
+		} else {
+			return fmt.Errorf("malformed boolean resp body: %q", b)
+		}
+		fallthrough
+
+	case SimpleStringPrefix, NumberPrefix, DoublePrefix, BigNumberPrefix:
 		reader := byteReaderPool.Get().(*bytes.Reader)
 		reader.Reset(b)
 		err := a.unmarshalSingle(reader, reader.Len())
 		byteReaderPool.Put(reader)
 		return err
+
 	default:
-		return fmt.Errorf("unknown type prefix %q", b[0])
+		return fmt.Errorf("unknown type prefix %q", prefix)
 	}
 }
 
@@ -1618,7 +1781,8 @@ func (a Any) unmarshalSingle(body io.Reader, n int) error {
 
 	switch ai := a.I.(type) {
 	case nil:
-		// just read it and do nothing
+		// just read it and do nothing. This only catches the case of a.I being
+		// actually nil, not a typed nil pointer.
 		err = bytesutil.ReadNDiscard(body, n)
 	case *string:
 		scratch := bytesutil.GetBytes()
@@ -1626,10 +1790,15 @@ func (a Any) unmarshalSingle(body io.Reader, n int) error {
 		*ai = string(*scratch)
 		bytesutil.PutBytes(scratch)
 	case *[]byte:
+		if *ai == nil {
+			*ai = []byte{}
+		}
 		*ai, err = bytesutil.ReadNAppend(body, (*ai)[:0], n)
 	case *bool:
-		ui, err = bytesutil.ReadUint(body, n)
-		*ai = ui > 0
+		var f float64
+		f, err = bytesutil.ReadFloat(body, 64, n)
+		*ai = f != 0
+		break
 	case *int:
 		i, err = bytesutil.ReadInt(body, n)
 		*ai = int(i)
@@ -1683,14 +1852,33 @@ func (a Any) unmarshalSingle(body io.Reader, n int) error {
 		}
 		err = ai.UnmarshalBinary(*scratch)
 	default:
-		scratch := bytesutil.GetBytes()
-		defer bytesutil.PutBytes(scratch)
-		if *scratch, err = bytesutil.ReadNAppend(body, *scratch, n); err != nil {
-			break
+
+		discardAndErr := func(fmtStr string, args ...interface{}) {
+			scratch := bytesutil.GetBytes()
+			defer bytesutil.PutBytes(scratch)
+			if *scratch, err = bytesutil.ReadNAppend(body, *scratch, n); err != nil {
+				return
+			}
+			err = fmt.Errorf(fmtStr+", message body was %q", append(args, *scratch))
+			err = resp.ErrConnUsable{Err: err}
 		}
-		err = resp.ErrConnUsable{
-			Err: fmt.Errorf("can't unmarshal into %T, message body was: %q", a.I, *scratch),
+
+		// check if the receiver is a non-nil pointer to a pointer, and if so
+		// unmarshal into _that_, possibly filling in the inner pointer if it's
+		// nil.
+		if ptr := reflect.ValueOf(a.I); ptr.Kind() == reflect.Ptr {
+			if ptr.IsNil() {
+				discardAndErr("can't unmarshal into nil %s", ptr.Type())
+				break
+			} else if innerPtr := ptr.Elem(); innerPtr.Kind() == reflect.Ptr {
+				if innerPtr.IsNil() {
+					innerPtr.Set(reflect.New(innerPtr.Type().Elem()))
+				}
+				return Any{I: innerPtr.Interface()}.unmarshalSingle(body, n)
+			}
 		}
+
+		discardAndErr("can't unmarshal into %T", a.I)
 	}
 
 	return err
@@ -1709,48 +1897,85 @@ func (a Any) unmarshalNil() error {
 	return nil
 }
 
-func (a Any) unmarshalArray(br *bufio.Reader, l int64) error {
-	if a.I == nil {
-		return discardMulti(br, int(l))
+func (a Any) maybeUnmarshalRESP(br *bufio.Reader, stream bool) (bool, error) {
+	if !stream {
+		return true, a.UnmarshalRESP(br)
+	}
+
+	// TODO this might cause Any to end up on the heap
+	streamAgg := StreamedAggregatedElement{Unmarshaler: &a}
+	err := streamAgg.UnmarshalRESP(br)
+	return !streamAgg.End, err
+}
+
+func (a Any) unmarshalAgg(prefix Prefix, br *bufio.Reader, l int64) error {
+	if prefix == MapPrefix {
+		l *= 2
 	}
 
 	size := int(l)
+	stream := size < 0
+	if a.I == nil {
+		return discardMulti(br, size)
+	}
+
 	v := reflect.ValueOf(a.I)
 	if v.Kind() != reflect.Ptr {
 		err := resp.ErrConnUsable{
-			Err: fmt.Errorf("can't unmarshal array into %T", a.I),
+			Err: fmt.Errorf("can't unmarshal resp %s into %T", prefix, a.I),
 		}
-		return discardMultiAfterErr(br, int(l), err)
+		return discardMultiAfterErr(br, size, err)
 	}
-	v = reflect.Indirect(v)
+
+	for ; v.Kind() == reflect.Ptr; v = reflect.Indirect(v) {
+		// this loop de-references as many pointers as possible.
+	}
 
 	switch v.Kind() {
 	case reflect.Slice:
-		if size > v.Cap() || v.IsNil() {
-			newV := reflect.MakeSlice(v.Type(), size, size)
-			// we copy only because there might be some preset values in there
-			// already that we're intended to decode into,
-			// e.g.  []interface{}{int8(0), ""}
-			reflect.Copy(newV, v)
-			v.Set(newV)
-		} else if size != v.Len() {
-			v.SetLen(size)
+		slice := v
+		if size > slice.Cap() || slice.IsNil() {
+			sliceSize := size
+			if stream {
+				sliceSize = 8
+			}
+			slice.Set(reflect.MakeSlice(slice.Type(), 0, sliceSize))
+		} else {
+			slice.SetLen(0)
 		}
 
-		for i := 0; i < size; i++ {
-			ai := Any{I: v.Index(i).Addr().Interface()}
-			if err := ai.UnmarshalRESP(br); err != nil {
-				return discardMultiAfterErr(br, int(l)-i-1, err)
+		// TODO this isn't ideal, but it works for now. Ideally this loop would
+		// be unmarshaling straight into slice elements based on i, expanding
+		// slice as needed, before finally setting the length appropriately at
+		// the end.
+		into := reflect.New(v.Type().Elem())
+		for i := 0; i < size || stream; i++ {
+			into.Elem().Set(reflect.Zero(into.Type().Elem()))
+			anyInto := Any{I: into.Interface()}
+			if more, err := anyInto.maybeUnmarshalRESP(br, stream); err != nil {
+				return discardMultiAfterErr(br, size-i-1, err)
+			} else if !more {
+				break
 			}
+			slice = reflect.Append(slice, into.Elem())
 		}
+		v.Set(slice)
 		return nil
 
 	case reflect.Map:
-		if size%2 != 0 {
-			err := resp.ErrConnUsable{Err: errors.New("cannot decode redis array with odd number of elements into map")}
-			return discardMultiAfterErr(br, int(l), err)
+		if !stream && size%2 != 0 {
+			err := resp.ErrConnUsable{Err: fmt.Errorf("cannot decode resp %s with odd number of elements into map", prefix)}
+			return discardMultiAfterErr(br, size, err)
 		} else if v.IsNil() {
-			v.Set(reflect.MakeMapWithSize(v.Type(), size/2))
+			mapSize := size
+			if stream {
+				mapSize = 3
+			}
+			v.Set(reflect.MakeMapWithSize(v.Type(), mapSize))
+		} else {
+			for _, key := range v.MapKeys() {
+				v.SetMapIndex(key, reflect.Value{})
+			}
 		}
 
 		var kvs reflect.Value
@@ -1763,13 +1988,15 @@ func (a Any) unmarshalArray(br *bufio.Reader, l int64) error {
 			vvs = reflect.New(v.Type().Elem())
 		}
 
-		for i := 0; i < size; i += 2 {
+		for i := 0; i < size || stream; i += 2 {
 			kv := kvs
 			if !kv.IsValid() {
 				kv = reflect.New(v.Type().Key())
 			}
-			if err := (Any{I: kv.Interface()}).UnmarshalRESP(br); err != nil {
-				return discardMultiAfterErr(br, int(l)-i-1, err)
+			if more, err := (Any{I: kv.Interface()}).maybeUnmarshalRESP(br, stream); err != nil {
+				return discardMultiAfterErr(br, size-i-1, err)
+			} else if !more {
+				break
 			}
 
 			vv := vvs
@@ -1785,21 +2012,23 @@ func (a Any) unmarshalArray(br *bufio.Reader, l int64) error {
 		return nil
 
 	case reflect.Struct:
-		if size%2 != 0 {
-			err := resp.ErrConnUsable{Err: errors.New("cannot decode redis array with odd number of elements into struct")}
-			return discardMultiAfterErr(br, int(l), err)
+		if !stream && size%2 != 0 {
+			err := resp.ErrConnUsable{Err: fmt.Errorf("cannot decode resp %s with odd number of elements into struct", prefix)}
+			return discardMultiAfterErr(br, size, err)
 		}
 
 		structFields := getStructFields(v.Type())
-		var field BlobStringBytes
+		var field string
 
-		for i := 0; i < size; i += 2 {
-			if err := field.UnmarshalRESP(br); err != nil {
-				return discardMultiAfterErr(br, int(l)-i-1, err)
+		for i := 0; i < size || stream; i += 2 {
+			if more, err := (Any{I: &field}).maybeUnmarshalRESP(br, stream); err != nil {
+				return discardMultiAfterErr(br, size-i-1, err)
+			} else if !more {
+				break
 			}
 
 			var vv reflect.Value
-			structField, ok := structFields[string(field.B)] // no allocation, since Go 1.3
+			structField, ok := structFields[field]
 			if ok {
 				vv = getStructField(v, structField.indices)
 			}
@@ -1807,20 +2036,20 @@ func (a Any) unmarshalArray(br *bufio.Reader, l int64) error {
 			if !ok || !vv.IsValid() {
 				// discard the value
 				if err := (Any{}).UnmarshalRESP(br); err != nil {
-					return discardMultiAfterErr(br, int(l)-i-2, err)
+					return discardMultiAfterErr(br, size-i-2, err)
 				}
 				continue
 			}
 
 			if err := (Any{I: vv.Interface()}).UnmarshalRESP(br); err != nil {
-				return discardMultiAfterErr(br, int(l)-i-2, err)
+				return discardMultiAfterErr(br, size-i-2, err)
 			}
 		}
 
 		return nil
 
 	default:
-		err := resp.ErrConnUsable{Err: fmt.Errorf("cannot decode redis array into %v", v.Type())}
+		err := resp.ErrConnUsable{Err: fmt.Errorf("cannot decode resp %s into %v", prefix, v.Type())}
 		return discardMultiAfterErr(br, int(l), err)
 	}
 }
@@ -1970,8 +2199,8 @@ func (rm *RawMessage) unmarshal(br *bufio.Reader) error {
 	}
 	body := b[1 : len(b)-2]
 
-	switch b[0] {
-	case ArrayPrefix[0]:
+	switch Prefix(b[0]) {
+	case ArrayPrefix:
 		l, err := bytesutil.ParseInt(body)
 		if err != nil {
 			return err
@@ -1984,7 +2213,7 @@ func (rm *RawMessage) unmarshal(br *bufio.Reader) error {
 			}
 		}
 		return nil
-	case BlobStringPrefix[0]:
+	case BlobStringPrefix:
 		l, err := bytesutil.ParseInt(body) // fuck DRY
 		if err != nil {
 			return err
@@ -1993,7 +2222,7 @@ func (rm *RawMessage) unmarshal(br *bufio.Reader) error {
 		}
 		*rm, err = bytesutil.ReadNAppend(br, *rm, int(l+2))
 		return err
-	case SimpleErrorPrefix[0], SimpleStringPrefix[0], NumberPrefix[0]:
+	case SimpleErrorPrefix, SimpleStringPrefix, NumberPrefix:
 		return nil
 	default:
 		return fmt.Errorf("unknown type prefix %q", b[0])
